@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: nightly
+      SENTRY_DSN: ""
     strategy:
       fail-fast: false
       matrix:
