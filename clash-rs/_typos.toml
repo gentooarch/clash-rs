@@ -1,0 +1,16 @@
+[default]
+locale = "en"
+
+[default.extend-words]
+# Session:typ
+typ = "typ"
+
+[files]
+extend-exclude = [
+    "docs",
+    "bench",
+    "clash-bin/tests/data/config/public",
+    "clash-bin/tests/data/config/*.cert",
+    "clash-dns/src/resources",
+    "clash-netstack/examples/flamegraph.svg",
+]
