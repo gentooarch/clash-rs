@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use http::{Request, StatusCode};
 use std::collections::HashMap;
-use tokio_tungstenite::{
-    client_async_with_config,
-    tungstenite::{handshake::client::generate_key, protocol::WebSocketConfig},
+use tokio_tungstenite::tungstenite::{
+    handshake::client::generate_key, protocol::WebSocketConfig,
 };
 
 use super::Transport;
-use crate::{common::errors::map_io_error, proxy::AnyStream};
+use crate::proxy::AnyStream;
 
 mod websocket;
 mod websocket_early_data;
@@ -101,9 +100,7 @@ impl Transport for Client {
             Ok(Box::new(early_data_conn))
         } else {
             let (stream, resp) =
-                client_async_with_config(req, stream, Some(ws_config))
-                    .await
-                    .map_err(map_io_error)?;
+                WebsocketConn::client(stream, req, Some(ws_config)).await?;
 
             if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
                 return Err(std::io::Error::new(
@@ -111,7 +108,7 @@ impl Transport for Client {
                     "invalid response",
                 ));
             }
-            Ok(Box::new(WebsocketConn::from_websocket(stream)))
+            Ok(Box::new(stream))
         }
     }
 }
