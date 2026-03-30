@@ -283,7 +283,8 @@ mod tests {
         };
         let handler = Arc::new(Handler::new(opts));
 
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        run_test_suites_and_cleanup(handler, runner, Suite::all_with_streaming())
+            .await
     }
 
     async fn get_grpc_runner() -> anyhow::Result<DockerTestRunner> {

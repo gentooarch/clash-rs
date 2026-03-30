@@ -540,12 +540,226 @@ pub async fn dns_test(handler: Arc<dyn OutboundHandler>) -> anyhow::Result<()> {
     bail!("Failed to receive DNS response after 3 attempts")
 }
 
+pub async fn streaming_tcp_test(
+    handler: Arc<dyn OutboundHandler>,
+    gateway_ip: Option<String>,
+    port: u16,
+) -> anyhow::Result<()> {
+    const STREAMING_CHUNK_SIZE: usize = 4 * 1024;
+    const STREAMING_CHUNK_COUNT: usize = 128;
+    const STREAMING_CHUNK_DELAY: Duration = Duration::from_millis(20);
+    const STREAMING_READ_TIMEOUT: Duration = Duration::from_secs(2);
+    const STREAMING_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let destination_list = destination_list(gateway_ip);
+    let resolver = config_helper::build_dns_resolver().await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}").as_str()).await?;
+
+    info!(
+        "streaming target local server started at: {}",
+        listener.local_addr()?
+    );
+
+    async fn destination_fn<T>(incoming: T) -> anyhow::Result<()>
+    where
+        T: AsyncRead + AsyncWrite,
+    {
+        let (mut read_half, mut write_half) = split(incoming);
+        let mut start = [0u8; 1];
+
+        read_half.read_exact(&mut start).await?;
+        assert_eq!(start, [1]);
+
+        for idx in 0..STREAMING_CHUNK_COUNT {
+            let chunk = vec![idx as u8; STREAMING_CHUNK_SIZE];
+            write_half.write_all(&chunk).await?;
+            write_half.flush().await?;
+            tokio::time::sleep(STREAMING_CHUNK_DELAY).await;
+        }
+
+        Ok(())
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let target_local_server_handler = tokio::spawn(async move {
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                data = listener.accept() => {
+                    match data {
+                        Ok((stream, _)) => {
+                            info!(
+                                "Accepted connection(streaming tcp) from: {:?}",
+                                stream.peer_addr().ok()
+                            );
+                            if let Err(e) = destination_fn(stream).await {
+                                info!("Error handling streaming connection(tcp): {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            info!("Error accepting streaming connection(tcp): {}", e);
+                            continue;
+                        }
+                    }
+                }
+                _ = &mut rx => {
+                    info!("streaming target_local_server_handler received shutdown signal, exiting...");
+                    return Ok(());
+                }
+            }
+        }
+    });
+
+    async fn proxy_fn(stream: Box<dyn ChainedStream>) -> anyhow::Result<()> {
+        let (mut read_half, mut write_half) = split(stream);
+        let mut buf = vec![0; STREAMING_CHUNK_SIZE];
+        let start = Instant::now();
+        let mut last_progress = start;
+        let mut max_gap = Duration::ZERO;
+
+        write_half.write_all(&[1]).await?;
+        write_half.flush().await?;
+
+        for idx in 0..STREAMING_CHUNK_COUNT {
+            tokio::time::timeout(
+                STREAMING_READ_TIMEOUT,
+                read_half.read_exact(&mut buf),
+            )
+            .await??;
+
+            let now = Instant::now();
+            max_gap = max_gap.max(now.saturating_duration_since(last_progress));
+            last_progress = now;
+
+            assert!(
+                buf.iter().all(|byte| *byte == idx as u8),
+                "unexpected streaming payload at chunk {idx}"
+            );
+        }
+
+        info!(
+            "streaming tcp test completed in {:?} with max read gap {:?}",
+            start.elapsed(),
+            max_gap
+        );
+
+        Ok(())
+    }
+
+    let proxy_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mut first_error: Option<anyhow::Error> = None;
+
+        for destination in &destination_list {
+            tracing::trace!(
+                "Attempting TCP connection(streaming tcp) to: {}",
+                destination
+            );
+
+            let dst: SocksAddr = match (destination.clone(), port).try_into() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse destination address(streaming tcp): {}",
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let sess = Session {
+                destination: dst.clone(),
+                ..Default::default()
+            };
+
+            let stream = match tokio::time::timeout(
+                Duration::from_secs(3),
+                handler.connect_stream(&sess, resolver.clone()),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    tracing::info!(
+                        "Successfully connected(streaming tcp) to: {:?}",
+                        dst
+                    );
+                    stream
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        "Failed to proxy connection(streaming tcp) to {:?}: {}",
+                        dst,
+                        e
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(e.into());
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "connect_stream timeout (3s) for destination(streaming tcp): {}",
+                        destination
+                    );
+                    continue;
+                }
+            };
+
+            match tokio::time::timeout(STREAMING_TOTAL_TIMEOUT, proxy_fn(stream))
+                .await
+            {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        "proxy_fn succeeded for destination(streaming tcp): {}",
+                        destination
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        "proxy_fn failed for destination(streaming tcp) {}: {}",
+                        destination,
+                        e
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "proxy_fn timeout ({:?}) for destination(streaming tcp): {}",
+                        STREAMING_TOTAL_TIMEOUT,
+                        destination
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Err(anyhow!(
+                "all destination test error(streaming tcp): [{:?}]",
+                destination_list
+            ))
+        }
+    });
+
+    let proxy_res = proxy_task.await?;
+    tx.send(()).ok();
+    let server_res = target_local_server_handler.await?;
+
+    proxy_res?;
+    server_res
+}
+
 #[derive(Clone, Copy)]
 pub enum Suite {
     PingPongTcp,
     PingPongUdp,
     LatencyTcp,
     DnsUdp,
+    StreamingTcp,
 }
 
 impl Suite {
@@ -555,6 +769,16 @@ impl Suite {
             Suite::PingPongUdp,
             Suite::LatencyTcp,
             Suite::DnsUdp,
+        ]
+    }
+
+    pub const fn all_with_streaming() -> &'static [Suite] {
+        &[
+            Suite::PingPongTcp,
+            Suite::PingPongUdp,
+            Suite::LatencyTcp,
+            Suite::DnsUdp,
+            Suite::StreamingTcp,
         ]
     }
 
@@ -619,6 +843,20 @@ pub async fn run_test_suites_and_cleanup(
                             return Err(rv);
                         } else {
                             tracing::info!("dns_test success");
+                        }
+                    }
+                    Suite::StreamingTcp => {
+                        let rv = streaming_tcp_test(
+                            handler.clone(),
+                            gateway_ip.clone(),
+                            10011,
+                        )
+                        .await;
+                        if rv.is_err() {
+                            tracing::error!("streaming_tcp_test failed: {:?}", rv);
+                            return rv;
+                        } else {
+                            tracing::info!("streaming_tcp_test success");
                         }
                     }
                 }

@@ -15,6 +15,12 @@ mod websocket_early_data;
 pub use websocket::WebsocketConn;
 pub use websocket_early_data::WebsocketEarlyDataConn;
 
+const DEFAULT_WS_READ_BUFFER_SIZE: usize = 64 * 1024;
+const DEFAULT_WS_WRITE_BUFFER_SIZE: usize = 8 * 1024;
+const DEFAULT_WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
+const DEFAULT_WS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_WS_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 pub struct Client {
     server: String,
     port: u16,
@@ -46,6 +52,10 @@ impl Client {
         }
     }
 
+    fn ws_config(&self) -> WebSocketConfig {
+        self.ws_config.clone().unwrap_or_else(default_ws_config)
+    }
+
     fn req(&self) -> Request<()> {
         let mut request = Request::builder()
             .method("GET")
@@ -65,22 +75,33 @@ impl Client {
     }
 }
 
+fn default_ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(DEFAULT_WS_READ_BUFFER_SIZE)
+        .write_buffer_size(DEFAULT_WS_WRITE_BUFFER_SIZE)
+        .max_write_buffer_size(DEFAULT_WS_MAX_WRITE_BUFFER_SIZE)
+        .max_message_size(Some(DEFAULT_WS_MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(DEFAULT_WS_MAX_FRAME_SIZE))
+        .accept_unmasked_frames(false)
+}
+
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         let req = self.req();
+        let ws_config = self.ws_config();
         if self.max_early_data > 0 {
             let early_data_conn = WebsocketEarlyDataConn::new(
                 stream,
                 req,
-                self.ws_config,
+                Some(ws_config),
                 self.early_data_header_name.clone(),
                 self.max_early_data,
             );
             Ok(Box::new(early_data_conn))
         } else {
             let (stream, resp) =
-                client_async_with_config(req, stream, self.ws_config)
+                client_async_with_config(req, stream, Some(ws_config))
                     .await
                     .map_err(map_io_error)?;
 

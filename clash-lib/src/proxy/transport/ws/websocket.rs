@@ -1,4 +1,8 @@
-use std::{fmt::Debug, pin::Pin, task::Poll};
+use std::{
+    fmt::Debug,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream, ready};
@@ -35,57 +39,60 @@ impl WebsocketConn {
 impl AsyncRead for WebsocketConn {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.read_buffer.is_empty() {
-            let to_read = std::cmp::min(buf.remaining(), self.read_buffer.len());
-            let for_read = self.read_buffer.split_to(to_read);
-            buf.put_slice(&for_read[..to_read]);
-            return std::task::Poll::Ready(Ok(()));
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if !self.read_buffer.is_empty() {
+                let to_read = std::cmp::min(buf.remaining(), self.read_buffer.len());
+                let for_read = self.read_buffer.split_to(to_read);
+                buf.put_slice(&for_read[..to_read]);
+                return Poll::Ready(Ok(()));
+            }
+
+            match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                Some(Ok(Message::Binary(data))) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+
+                    let to_read = std::cmp::min(buf.remaining(), data.len());
+                    buf.put_slice(&data[..to_read]);
+                    if to_read < data.len() {
+                        self.read_buffer.extend_from_slice(&data[to_read..]);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                Some(Ok(Message::Close(_))) | None => return Poll::Ready(Ok(())),
+                Some(Ok(Message::Text(_))) => {
+                    return Poll::Ready(Err(new_io_error(
+                        "ws invalid message type",
+                    )));
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => return Poll::Ready(Err(map_io_error(err))),
+            }
         }
-        Poll::Ready(ready!(Pin::new(&mut self.inner).poll_next(cx)).map_or(
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "ws broken pipe",
-            )),
-            |item| {
-                item.map_or(
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "ws broken pipe",
-                    )),
-                    |msg| match msg {
-                        Message::Binary(data) => {
-                            let to_read = std::cmp::min(buf.remaining(), data.len());
-                            buf.put_slice(&data[..to_read]);
-                            if to_read < data.len() {
-                                self.read_buffer.extend_from_slice(&data[to_read..]);
-                            }
-                            Ok(())
-                        }
-                        Message::Close(_) => Ok(()),
-                        _ => Err(new_io_error("ws invalid message type")),
-                    },
-                )
-            },
-        ))
     }
 }
 
 impl AsyncWrite for WebsocketConn {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         ready!(Pin::new(&mut self.inner).poll_ready(cx)).map_err(map_io_error)?;
         let message = Message::Binary(Bytes::copy_from_slice(buf));
         Pin::new(&mut self.inner)
             .start_send(message)
             .map_err(map_io_error)?;
-        ready!(self.poll_flush(cx)?);
-        std::task::Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(

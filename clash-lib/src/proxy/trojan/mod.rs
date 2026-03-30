@@ -285,7 +285,8 @@ mod tests {
             .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
             .await;
         // ignore the udp test
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(handler, container, Suite::all_with_streaming())
+            .await
     }
 
     async fn get_grpc_runner() -> anyhow::Result<DockerTestRunner> {
